@@ -91,7 +91,7 @@ final class ProcessImpl extends Process {
 
         AIX(LaunchMechanism.POSIX_SPAWN, LaunchMechanism.FORK),
 
-        HAIKU(LaunchMechanism.POSIX_SPAWN, LaunchMechanism.VFORK, LaunchMechanism.FORK);
+        HAIKU(LaunchMechanism.FORK, LaunchMechanism.VFORK);
 
         final LaunchMechanism defaultLaunchMechanism;
         final Set<LaunchMechanism> validLaunchMechanisms;
