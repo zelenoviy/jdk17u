@@ -420,15 +420,6 @@ void os::Haiku::init_thread_fpu_state(void) {
 #endif // !AMD64
 }
 
-bool os::is_allocatable(size_t bytes) {
-#ifdef AMD64
-  // unused on amd64?
-  return true;
-#else
-  return bytes <= (size_t)1400 * M;
-#endif // AMD64
-}
-
 juint os::cpu_microcode_revision() {
   juint result = 0;
   // TODO implement

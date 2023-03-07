@@ -115,7 +115,7 @@
 julong os::Haiku::_physical_memory = 0;
 
 pthread_t os::Haiku::_main_thread;
-int os::Haiku::_page_size = 0;
+int os::Haiku::_page_size = -1;
 
 static jlong initial_time_count = 0;
 static int clock_tics_per_sec = 0;
@@ -146,7 +146,7 @@ julong os::Haiku::available_memory() {
 void os::Haiku::print_uptime_info(outputStream* st) {
   system_info si;
   get_system_info(&si);
-  
+
   os::print_dhm(st, "OS uptime:", si.boot_time / 1000000);
 }
 
@@ -546,36 +546,7 @@ double os::elapsedVTime() {
   assert(result == B_OK, "get_thread_info failed");
   return (info.user_time + info.kernel_time) / SEC_IN_MICROSECS;
 }
-/*
-jlong os::javaTimeMillis() {
-  timeval time;
-  int status = gettimeofday(&time, NULL);
-  assert(status != -1, "haiku error");
-  return jlong(time.tv_sec) * 1000  +  jlong(time.tv_usec / 1000);
-}
 
-void os::javaTimeSystemUTC(jlong &seconds, jlong &nanos) {
-  timeval time;
-  int status = gettimeofday(&time, NULL);
-  assert(status != -1, "bsd error");
-  seconds = jlong(time.tv_sec);
-  nanos = jlong(time.tv_usec) * 1000;
-}
-
-jlong os::javaTimeNanos() {
-  // nano frequency on x86, micro otherwise
-  return system_time_nsecs();
-}
-
-void os::javaTimeNanos_info(jvmtiTimerInfo *info_ptr) {
-  info_ptr->max_value = ALL_64_BITS;
-
-  // CLOCK_MONOTONIC - amount of time since some arbitrary point in the past
-  info_ptr->may_skip_backward = false;      // not subject to resetting or drifting
-  info_ptr->may_skip_forward = false;       // not subject to resetting or drifting
-  info_ptr->kind = JVMTI_TIMER_ELAPSED;     // elapsed not CPU time
-}
-*/
 // Return the real, user, and system times in seconds from an
 // arbitrary fixed point in the past.
 bool os::getTimesSecs(double* process_real_time,
@@ -875,15 +846,6 @@ void * os::dll_load(const char *filename, char *ebuf, int ebuflen)
   return NULL;
 }
 
-
-void* os::dll_lookup(void* handle, const char* name) {
-  return dlsym(handle, name);
-}
-
-void* os::get_default_process_handle() {
-  return (void*)::dlopen(NULL, RTLD_LAZY);
-}
-
 void os::print_dll_info(outputStream *st) {
   st->print_cr("Dynamic libraries:");
 
@@ -1029,6 +991,7 @@ void os::jvm_path(char *buf, jint buflen) {
   }
 
   strncpy(saved_jvm_path, buf, MAXPATHLEN);
+  saved_jvm_path[MAXPATHLEN - 1] = '\0';
 }
 
 void os::print_jni_name_prefix_on(outputStream* st, int args_size) {
@@ -1051,6 +1014,40 @@ int os::vm_page_size() {
 int os::vm_allocation_granularity() {
   assert(os::Haiku::page_size() != -1, "must call os::init");
   return os::Haiku::page_size();
+}
+
+// 'requested_addr' is only treated as a hint, the return value may or
+// may not start from the requested address. Unlike Bsd mmap(), this
+// function returns NULL to indicate failure.
+static char* anon_mmap(char* requested_addr, size_t bytes, bool exec) {
+  // MAP_FIXED is intentionally left out, to leave existing mappings intact.
+  const int flags = MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS;
+
+  // Map reserved/uncommitted pages PROT_NONE so we fail early if we
+  // touch an uncommitted page. Otherwise, the read/write might
+  // succeed if we have enough swap space to back the physical page.
+  char* addr = (char*)::mmap(requested_addr, bytes, PROT_NONE, flags, -1, 0);
+
+  return addr == MAP_FAILED ? NULL : addr;
+}
+
+static int anon_munmap(char * addr, size_t size) {
+  return ::munmap(addr, size) == 0;
+}
+
+static bool haiku_mprotect(char* addr, size_t size, int prot) {
+  char* bottom = (char*)align_down((intptr_t)addr, os::Haiku::page_size());
+
+  // According to SUSv3, mprotect() should only be used with mappings
+  // established by mmap(), and mmap() always maps whole pages. Unaligned
+  // 'addr' likely indicates problem in the VM (e.g. trying to change
+  // protection of malloc'ed or statically allocated memory). Check the
+  // caller if you hit this assert.
+  assert(addr == bottom, "sanity check");
+
+  size = align_up(pointer_delta(addr, bottom, 1) + size, os::Haiku::page_size());
+  Events::log(NULL, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(bottom), p2i(bottom+size), prot);
+  return ::mprotect(bottom, size, prot) == 0;
 }
 
 static void warn_fail_commit_memory(char* addr, size_t size, bool exec,
@@ -1088,42 +1085,10 @@ void os::pd_commit_memory_or_exit(char* addr, size_t size,
   pd_commit_memory_or_exit(addr, size, exec, mesg);
 }
 
-void os::pd_realign_memory(char *addr, size_t bytes, size_t alignment_hint) { 
+void os::pd_realign_memory(char *addr, size_t bytes, size_t alignment_hint) {
 }
 
-void os::pd_free_memory(char *addr, size_t bytes, size_t alignment_hint) { 
-}
-
-void os::numa_make_global(char *addr, size_t bytes)    { 
-}
-
-void os::numa_make_local(char *addr, size_t bytes, int lgrp_hint)    { 
-}
-
-bool os::numa_topology_changed()                       { return false; }
-
-size_t os::numa_get_groups_num()                       { return 1; }
-
-int os::numa_get_group_id()                            { return 0; }
-
-size_t os::numa_get_leaf_groups(int *ids, size_t size) {
-  if (size > 0) {
-    ids[0] = 0;
-    return 1;
-  }
-  return 0;
-}
-
-int os::numa_get_group_id_for_address(const void* address) {
-  return 0;
-}
-
-bool os::get_page_info(char *start, page_info* info) {
-  return false;
-}
-
-char *os::scan_pages(char *start, char* end, page_info* page_expected, page_info* page_found) {
-  return end;
+void os::pd_free_memory(char *addr, size_t bytes, size_t alignment_hint) {
 }
 
 bool os::pd_uncommit_memory(char* addr, size_t size, bool exec) {
@@ -1132,63 +1097,13 @@ bool os::pd_uncommit_memory(char* addr, size_t size, bool exec) {
   return res  != (uintptr_t) MAP_FAILED;
 }
 
-// If the (growable) stack mapping already extends beyond the point
-// where we're going to put our guard pages, truncate the mapping at
-// that point by munmap()ping it.  This ensures that when we later
-// munmap() the guard pages we don't leave a hole in the stack
-// mapping. This only affects the main/initial thread, but guard
-// against future OS changes
-bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
-  return os::commit_memory(addr, size, !ExecMem);
-}
-
-// If this is a growable mapping, remove the guard pages entirely by
-// munmap()ping them.  If not, just call uncommit_memory().
-bool os::remove_stack_guard_pages(char* addr, size_t size) {
-  return os::uncommit_memory(addr, size);
-}
-
-// 'requested_addr' is only treated as a hint, the return value may or
-// may not start from the requested address. Unlike Bsd mmap(), this
-// function returns NULL to indicate failure.
-static char* anon_mmap(char* requested_addr, size_t bytes, bool exec) {
-  // MAP_FIXED is intentionally left out, to leave existing mappings intact.
-  const int flags = MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS;
-
-  // Map reserved/uncommitted pages PROT_NONE so we fail early if we
-  // touch an uncommitted page. Otherwise, the read/write might
-  // succeed if we have enough swap space to back the physical page.
-  char* addr = (char*)::mmap(requested_addr, bytes, PROT_NONE, flags, -1, 0);
-
-  return addr == MAP_FAILED ? NULL : addr;
-}
-
-static int anon_munmap(char * addr, size_t size) {
-  return ::munmap(addr, size) == 0;
-}
-
 char* os::pd_reserve_memory(size_t bytes, bool exec) {
-  return anon_mmap(NULL /* addr */, bytes, exec);
+  char* res = anon_mmap(NULL /* addr */, bytes, exec);
+  return res;
 }
 
 bool os::pd_release_memory(char* addr, size_t size) {
   return anon_munmap(addr, size);
-}
-
-static bool haiku_mprotect(char* addr, size_t size, int prot) {
-  // Linux wants the mprotect address argument to be page aligned.
-  char* bottom = (char*)align_down((intptr_t)addr, os::Haiku::page_size());
-
-  // According to SUSv3, mprotect() should only be used with mappings
-  // established by mmap(), and mmap() always maps whole pages. Unaligned
-  // 'addr' likely indicates problem in the VM (e.g. trying to change
-  // protection of malloc'ed or statically allocated memory). Check the
-  // caller if you hit this assert.
-  assert(addr == bottom, "sanity check");
-
-  size = align_up(pointer_delta(addr, bottom, 1) + size, os::Haiku::page_size());
-  Events::log(NULL, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(bottom), p2i(bottom+size), prot);
-  return ::mprotect(bottom, size, prot) == 0;
 }
 
 // Set protections specified
@@ -1215,31 +1130,20 @@ bool os::unguard_memory(char* addr, size_t size) {
   return haiku_mprotect(addr, size, PROT_READ|PROT_WRITE);
 }
 
-// No large page support on Haiku
-
-void os::large_page_init() {
+// If the (growable) stack mapping already extends beyond the point
+// where we're going to put our guard pages, truncate the mapping at
+// that point by munmap()ping it.  This ensures that when we later
+// munmap() the guard pages we don't leave a hole in the stack
+// mapping. This only affects the main/initial thread, but guard
+// against future OS changes
+bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
+  return os::commit_memory(addr, size, !ExecMem);
 }
 
-char* os::pd_reserve_memory_special(size_t bytes, size_t alignment, size_t page_size, char* req_addr, bool exec) {
-  fatal("os::reserve_memory_special should not be called on Haiku.");
-  return NULL;
-}
-
-bool os::pd_release_memory_special(char* base, size_t bytes) {
-  fatal("os::release_memory_special should not be called on Haiku.");
-  return false;
-}
-
-size_t os::large_page_size() {
-  return 0;
-}
-
-bool os::can_commit_large_page_memory() {
-  return false;
-}
-
-bool os::can_execute_large_page_memory() {
-  return false;
+// If this is a growable mapping, remove the guard pages entirely by
+// munmap()ping them.  If not, just call uncommit_memory().
+bool os::remove_stack_guard_pages(char* addr, size_t size) {
+  return os::uncommit_memory(addr, size);
 }
 
 char* os::pd_attempt_map_memory_to_file_at(char* requested_addr, size_t bytes, int file_desc) {
@@ -1282,12 +1186,63 @@ char* os::pd_attempt_reserve_memory_at(char* requested_addr, size_t bytes, bool 
   return NULL;
 }
 
+void os::numa_make_global(char *addr, size_t bytes)    {
+}
 
-// Sleep forever; naked call to OS-specific sleep; use with CAUTION
-void os::infinite_sleep() {
-  while (true) {    // sleep forever ...
-    ::sleep(100);   // ... 100 seconds at a time
+void os::numa_make_local(char *addr, size_t bytes, int lgrp_hint)    {
+}
+
+bool os::numa_topology_changed()                       { return false; }
+
+size_t os::numa_get_groups_num()                       { return 1; }
+
+int os::numa_get_group_id()                            { return 0; }
+
+size_t os::numa_get_leaf_groups(int *ids, size_t size) {
+  if (size > 0) {
+    ids[0] = 0;
+    return 1;
   }
+  return 0;
+}
+
+int os::numa_get_group_id_for_address(const void* address) {
+  return 0;
+}
+
+bool os::get_page_info(char *start, page_info* info) {
+  return false;
+}
+
+char *os::scan_pages(char *start, char* end, page_info* page_expected, page_info* page_found) {
+  return end;
+}
+
+// No large page support on Haiku
+
+void os::large_page_init() {
+}
+
+char* os::pd_reserve_memory_special(size_t bytes, size_t alignment, size_t page_size, char* req_addr, bool exec) {
+  fatal("os::reserve_memory_special should not be called on Haiku.");
+  return NULL;
+}
+
+bool os::pd_release_memory_special(char* base, size_t bytes) {
+  fatal("os::release_memory_special should not be called on Haiku.");
+  return false;
+}
+
+size_t os::large_page_size() {
+  return 0;
+}
+
+bool os::can_commit_large_page_memory() {
+  return false;
+}
+
+bool os::can_execute_large_page_memory() {
+  return false;
 }
 
 // Used to convert frequent JVM_Yield() to nops
@@ -1381,6 +1336,7 @@ void os::init(void) {
   init_random(1234567);
 
   Haiku::set_page_size(sysconf(_SC_PAGESIZE));
+  log_info(os)("Haiku::page_size() == %d",Haiku::page_size());
   if (Haiku::page_size() == -1) {
     fatal("os_haiku.cpp: os::init: sysconf failed (%s)",
           os::strerror(errno));
@@ -1567,47 +1523,8 @@ int os::compare_file_modified_times(const char* file1, const char* file2) {
   return diff;
 }
 
-bool os::message_box(const char* title, const char* message) {
-  int i;
-  fdStream err(defaultStream::error_fd());
-  for (i = 0; i < 78; i++) err.print_raw("=");
-  err.cr();
-  err.print_raw_cr(title);
-  for (i = 0; i < 78; i++) err.print_raw("-");
-  err.cr();
-  err.print_raw_cr(message);
-  for (i = 0; i < 78; i++) err.print_raw("=");
-  err.cr();
-
-  char buf[16];
-  // Prevent process from exiting upon "read error" without consuming all CPU
-  while (::read(0, buf, sizeof(buf)) <= 0) { ::sleep(100); }
-
-  return buf[0] == 'y' || buf[0] == 'Y';
-}
-
 int local_vsnprintf(char* buf, size_t count, const char* format, va_list args) {
   return ::vsnprintf(buf, count, format, args);
-}
-
-// Is a (classpath) directory empty?
-bool os::dir_is_empty(const char* path) {
-  DIR *dir = NULL;
-  struct dirent *ptr;
-
-  dir = opendir(path);
-  if (dir == NULL) return true;
-
-  /* Scan the directory */
-  bool result = true;
-  char buf[sizeof(struct dirent) + MAX_PATH];
-  while (result && (ptr = readdir(dir)) != NULL) {
-    if (strcmp(ptr->d_name, ".") != 0 && strcmp(ptr->d_name, "..") != 0) {
-      result = false;
-    }
-  }
-  closedir(dir);
-  return result;
 }
 
 // This code originates from JDK's sysOpen and open64_w
@@ -1741,8 +1658,8 @@ int os::available(int fd, jlong *bytes) {
 char* os::pd_map_memory(int fd, const char* file_name, size_t file_offset,
                      char *addr, size_t bytes, bool read_only,
                      bool allow_exec) {
-  log_debug(os)("os::pd_map_memory (file: %s, fd: %d, size: %ld, offs: %ld)\n", 
-  	file_name, fd, bytes, file_offset);                   	
+  log_debug(os)("os::pd_map_memory (file: %s, fd: %d, size: %ld, offs: %ld)\n",
+  	file_name, fd, bytes, file_offset);
   int prot;
   int flags = MAP_PRIVATE;
 
